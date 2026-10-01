@@ -25,6 +25,7 @@ jobs:
           ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
           ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
 
       - name: Remember jobs already sent
         run: |
