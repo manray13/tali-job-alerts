@@ -34,6 +34,21 @@ SEARCH_WORDS = [
     "billing", "biller", "claims", "authorization", "eligibility",
     "verification", "intake", "referral", "enrollment", "secretary",
     "member", "bilingual", "administrative", "healthcare", "medical",
+    "honorhealth", "banner", "abrazo", "aetna", "unitedhealthcare", "humana",
+    "cigna", "molina", "ahcccs", "medicaid", "medicare",
+]
+
+# Employers she especially wants to watch (hospitals + major private and
+# state-funded/AHCCCS/Medicare insurance plans). These get a 🏥 in the alert.
+WATCH_EMPLOYERS = [
+    "honorhealth", "honor health", "banner", "abrazo",
+    "unitedhealth", "unitedhealthcare", "united healthcare", "optum",
+    "aetna", "cvs health", "mercy care", "cigna", "humana", "molina",
+    "blue cross", "bcbs", "bcbsaz", "anthem", "elevance", "centene",
+    "arizona complete health", "ambetter", "wellcare", "health net",
+    "care1st", "banner university family care", "banner plans",
+    "ahcccs", "alignment health", "devoted health", "oscar health",
+    "kaiser", "medicare", "medicaid",
 ]
 
 # Adzuna drops jobs mentioning these, so they don't crowd out good ones
@@ -60,6 +75,9 @@ TITLE_KEYWORDS = [
     "patient experience", "care coordinator", "provider services",
     "customer care", "call center", "contact center", "bilingual",
     "pharmacy customer", "pharmacy service", "pharmacy support",
+    "unit clerk", "health unit coordinator", "access representative",
+    "access specialist", "financial counselor", "patient financial",
+    "admitting", "admissions representative", "concierge", "clerk",
     "health plan", "appeals", "grievance", "credentialing",
 ]
 
@@ -79,6 +97,10 @@ HEALTH_WORDS = [
     "dignity", "mayo", "valleywise", "phoenix children's", "unitedhealth",
     "aetna", "cvs health", "cigna", "humana", "blue cross", "centene",
     "mercy care", "ahcccs", "health plan", "hipaa", "prescription", "medical",
+    "honor health", "unitedhealthcare", "united healthcare", "optum", "molina",
+    "bcbs", "anthem", "elevance", "arizona complete health", "ambetter",
+    "wellcare", "health net", "care1st", "alignment health", "devoted health",
+    "oscar health", "kaiser",
 ]
 
 # Skip jobs whose TITLE contains any of these (need licenses/degrees, or not a fit)
@@ -123,6 +145,7 @@ TITLE_RE = word_pattern(TITLE_KEYWORDS)
 HEALTH_RE = word_pattern(HEALTH_WORDS)
 EXCLUDE_RE = word_pattern(EXCLUDE_TITLE)
 EXCLUDE_ANY_RE = word_pattern(EXCLUDE_ANYWHERE)
+WATCH_RE = word_pattern(WATCH_EMPLOYERS)
 
 
 def clean(text):
@@ -268,6 +291,8 @@ def send_alert(job):
     if mode != "Remote" and miles is not None:
         where += f" · about {miles:.0f} mi from home"
     lines = [company, where, pay_text(job)]
+    if WATCH_RE.search(company + " " + clean(job.get("description"))):
+        lines.insert(0, "🏥 Watched employer / insurance plan")
     text = clean(job.get("title")) + " " + clean(job.get("description"))
     if BILINGUAL_RE.search(text):
         lines.insert(0, "⭐ Bilingual / Spanish role — her Spanish is a plus")
