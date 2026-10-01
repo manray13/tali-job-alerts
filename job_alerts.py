@@ -28,6 +28,15 @@ MIN_HOURLY_PAY = 25          # skip jobs whose listed pay tops out below this
 KEEP_JOBS_WITHOUT_PAY = True  # many postings don't list pay; keep them
 MAX_DAYS_OLD = 3              # only look at postings from the last few days
 
+# Google Jobs searches (via SerpAPI). Each line = 1 search per day (free plan: 250/month)
+GOOGLE_LOCAL_SEARCHES = [
+    "medical receptionist front desk front office",
+    "member services representative healthcare insurance",
+    "patient access prior authorization medical billing",
+]
+GOOGLE_REMOTE_SEARCH = "remote member services healthcare insurance Arizona"
+GOOGLE_RADIUS_MILES = 25
+
 # Words Adzuna uses to pull candidate jobs (any one can match)
 SEARCH_WORDS = [
     "receptionist", "patient", "registration", "scheduler", "insurance",
@@ -132,6 +141,7 @@ FORGET_AFTER_DAYS = 45        # how long to remember jobs already sent
 APP_ID = os.environ.get("ADZUNA_APP_ID", "").strip()
 APP_KEY = os.environ.get("ADZUNA_APP_KEY", "").strip()
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
+SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "").strip()
 
 SEEN_FILE = Path(__file__).with_name("seen_jobs.json")
 ARIZONA = timezone(timedelta(hours=-7))  # Arizona has no daylight saving
@@ -175,6 +185,92 @@ def adzuna_search(extra_params):
                 raise
             print(f"Adzuna busy ({e}), retrying in 30 seconds...")
             time.sleep(30)
+
+
+JOB_BOARDS = ("linkedin", "indeed", "ziprecruiter", "glassdoor", "monster",
+              "simplyhired", "talent.com", "jooble", "adzuna", "snagajob", "lensa")
+
+
+def parse_google_salary(text):
+    """'$20–$25 an hour' or '$45K–$55K a year' -> yearly (lo, hi)."""
+    if not text:
+        return None, None
+    nums = []
+    for n, k in re.findall(r"\$?\s*([\d,.]+)\s*([kK])?", text):
+        try:
+            v = float(n.replace(",", ""))
+        except ValueError:
+            continue
+        nums.append(v * 1000 if k else v)
+    nums = [n for n in nums if n > 0]
+    if not nums:
+        return None, None
+    t = text.lower()
+    mult = 2080 if "hour" in t else 1
+    if "month" in t:
+        mult = 12
+    if "week" in t:
+        mult = 52
+    return min(nums) * mult, max(nums) * mult
+
+
+def google_days_old(label):
+    label = (label or "").lower()
+    if not label or "hour" in label or "minute" in label or "just" in label or "today" in label:
+        return 0
+    m = re.search(r"(\d+)\s*day", label)
+    if m:
+        return int(m.group(1))
+    return 999  # weeks / months ago
+
+
+def google_to_job(g):
+    ext = g.get("detected_extensions") or {}
+    options = g.get("apply_options") or []
+    direct = [o for o in options if not any(b in (o.get("title", "") + o.get("link", "")).lower()
+                                             for b in JOB_BOARDS)]
+    link = (direct or options or [{}])[0].get("link") or g.get("share_link", "")
+    lo, hi = parse_google_salary(ext.get("salary"))
+    loc = g.get("location", "")
+    desc = g.get("description", "")
+    if ext.get("work_from_home"):
+        desc = "Remote work from home. " + desc
+    sched = (ext.get("schedule_type") or "").lower().replace("-", "_")
+    import hashlib
+    return {
+        "id": "g:" + hashlib.md5((g.get("job_id") or g.get("title", "") + loc).encode()).hexdigest()[:16],
+        "title": g.get("title", ""),
+        "company": {"display_name": g.get("company_name", "")},
+        "location": {"display_name": loc, "area": [p.strip() for p in loc.split(",") if p.strip()]},
+        "description": desc,
+        "redirect_url": link,
+        "salary_min": lo, "salary_max": hi, "salary_is_predicted": "0",
+        "contract_time": sched if sched in ("full_time", "part_time") else None,
+        "posted_label": ext.get("posted_at", ""),
+        "source": "Google Jobs" + (f" via {g.get('via', '').replace('via ', '')}" if g.get("via") else ""),
+    }
+
+
+def google_search(query, location, remote=False):
+    params = {
+        "engine": "google_jobs", "q": query, "location": location,
+        "hl": "en", "gl": "us", "api_key": SERPAPI_KEY,
+    }
+    if remote:
+        params["ltype"] = 1
+    else:
+        params["lrad"] = round(GOOGLE_RADIUS_MILES * 1.609)
+    url = "https://serpapi.com/search.json?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(url, timeout=60) as resp:
+        data = json.load(resp)
+    if data.get("error") and "hasn't returned any results" not in data["error"]:
+        raise RuntimeError(data["error"])
+    jobs = []
+    for g in data.get("jobs_results", []):
+        job = google_to_job(g)
+        if google_days_old(job["posted_label"]) <= MAX_DAYS_OLD:
+            jobs.append(job)
+    return jobs
 
 
 def is_match(job):
@@ -265,6 +361,8 @@ def pay_text(job):
 
 
 def posted_text(job):
+    if job.get("posted_label"):
+        return "Posted " + job["posted_label"]
     try:
         dt = datetime.fromisoformat(job["created"].replace("Z", "+00:00")).astimezone(ARIZONA)
         return "Posted " + dt.strftime("%a %b %-d, %-I:%M %p")
@@ -274,9 +372,8 @@ def posted_text(job):
 
 def fingerprint(job):
     """Catches the same job reposted on several sites."""
-    parts = [clean(job.get("title")), (job.get("company") or {}).get("display_name", ""),
-             (job.get("location") or {}).get("display_name", "")]
-    return "fp:" + re.sub(r"[^a-z0-9]+", "", "|".join(parts).lower())
+    parts = [clean(job.get("title")), (job.get("company") or {}).get("display_name", "")]
+    return "fp2:" + re.sub(r"[^a-z0-9]+", "", "|".join(parts).lower())
 
 
 BILINGUAL_RE = re.compile(r"\b(bilingual|spanish)\b", re.I)
@@ -299,6 +396,7 @@ def send_alert(job):
     if job.get("contract_time"):
         lines.append(job["contract_time"].replace("_", " ").title())
     lines.append(posted_text(job))
+    lines.append("Found on " + job.get("source", "Adzuna"))
     body = {
         "topic": NTFY_TOPIC,
         "title": clean(job.get("title"))[:120],
@@ -347,12 +445,32 @@ def main():
         searches.append({"what_and": "remote"})
 
     jobs = {}
+    failures = 0
     for params in searches:
         try:
             for job in adzuna_search(params):
                 jobs[str(job.get("id"))] = job
         except Exception as e:
-            sys.exit(f"Adzuna search failed: {e}")
+            failures += 1
+            print(f"Adzuna search failed: {e}")
+
+    google_count = 0
+    if SERPAPI_KEY:
+        google_searches = [(q, "Glendale, Arizona, United States", False) for q in GOOGLE_LOCAL_SEARCHES]
+        if INCLUDE_REMOTE_ARIZONA or INCLUDE_REMOTE_OUT_OF_STATE:
+            google_searches.append((GOOGLE_REMOTE_SEARCH, "Arizona, United States", True))
+        for q, where, remote in google_searches:
+            try:
+                for job in google_search(q, where, remote):
+                    jobs.setdefault(job["id"], job)
+                    google_count += 1
+            except Exception as e:
+                failures += 1
+                print(f"Google Jobs search failed ({q}): {e}")
+        print(f"Google Jobs returned {google_count} recent postings.")
+
+    if not jobs and failures:
+        sys.exit("All searches failed; will try again next run.")
 
     seen = load_seen()
     new = [j for j_id, j in jobs.items()
