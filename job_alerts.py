@@ -155,7 +155,35 @@ def is_match(job):
         return False
     if not pay_ok(job):
         return False
+    if not location_ok(job):
+        return False
     return bool(HEALTH_RE.search(text))
+
+
+HOME_LAT, HOME_LON = 33.62, -112.18  # 85306, Glendale AZ
+
+
+def miles_from_home(lat, lon):
+    import math
+    r = 3959
+    p1, p2 = math.radians(HOME_LAT), math.radians(lat)
+    dp, dl = p2 - p1, math.radians(lon - HOME_LON)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def location_ok(job):
+    """Must be in Arizona; in-person/hybrid jobs must also be near Glendale."""
+    loc = job.get("location") or {}
+    places = " ".join(loc.get("area") or []) + " " + loc.get("display_name", "")
+    if not re.search(r"\barizona\b|\baz\b", places, re.I):
+        return False
+    if work_mode(job) == "Remote":
+        return True
+    lat, lon = job.get("latitude"), job.get("longitude")
+    if lat is None or lon is None or len(loc.get("area") or []) < 3:
+        return True  # no exact spot listed; Adzuna's radius search already limited it
+    return miles_from_home(float(lat), float(lon)) <= LOCAL_RADIUS_MILES + 5
 
 
 def pay_ok(job):
@@ -221,6 +249,12 @@ def send_alert(job):
         "message": "\n".join(l for l in lines if l),
         "click": job.get("redirect_url", ""),
         "tags": ["briefcase"],
+        "actions": [
+            {"action": "view", "label": "Open posting", "url": job.get("redirect_url", "")},
+            {"action": "view", "label": "Find on Google",
+             "url": "https://www.google.com/search?" + urllib.parse.urlencode(
+                 {"q": f"{clean(job.get('title'))} {company} {location} job", "ibp": "htl;jobs"})},
+        ],
     }
     req = urllib.request.Request(
         "https://ntfy.sh/", data=json.dumps(body).encode("utf-8"),
