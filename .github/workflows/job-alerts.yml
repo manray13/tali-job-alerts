@@ -1,36 +1,34 @@
 name: Tali job alerts
- 
+
 on:
   schedule:
-    # Every 30 minutes, 6:00 AM - 8:30 PM Arizona time (Arizona = UTC-7)
-    - cron: "*/30 13-23 * * *"
-    - cron: "*/30 0-3 * * *"
+    # Every day at 10:00 AM Arizona time (17:00 UTC; Arizona = UTC-7)
+    - cron: "0 17 * * *"
   workflow_dispatch:   # adds a "Run workflow" button for testing
- 
+
 permissions:
   contents: write
- 
+
 concurrency:
   group: job-alerts
- 
+
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
- 
+      - uses: actions/checkout@v5
+
       - name: Check for new jobs
         run: python3 job_alerts.py
         env:
           ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
           ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
- 
+
       - name: Remember jobs already sent
         run: |
           git config user.name "job-alerts-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add seen_jobs.json
           git diff --cached --quiet || (git commit -m "Update seen jobs" && git push)
- 
