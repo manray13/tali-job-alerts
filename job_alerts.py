@@ -22,6 +22,8 @@ from pathlib import Path
 HOME_ZIP = "85306"            # Glendale, AZ
 LOCAL_RADIUS_MILES = 25       # jobs within this distance of Glendale
 INCLUDE_REMOTE_ARIZONA = True # remote jobs listed for Arizona
+INCLUDE_REMOTE_OUT_OF_STATE = False  # change to True if she's open to remote jobs
+                                     # for companies based outside Arizona
 MIN_HOURLY_PAY = 25          # skip jobs whose listed pay tops out below this
 KEEP_JOBS_WITHOUT_PAY = True  # many postings don't list pay; keep them
 MAX_DAYS_OLD = 3              # only look at postings from the last few days
@@ -100,7 +102,7 @@ EXCLUDE_ANYWHERE = [
     "certified medical assistant", "cma required", "ptcb",
 ]
 
-MAX_ALERTS_PER_RUN = 10       # extras wait for the next run instead of spamming
+MAX_ALERTS_PER_RUN = 25       # extras wait for the next run instead of spamming
 FORGET_AFTER_DAYS = 45        # how long to remember jobs already sent
 
 # =====================================================================
@@ -141,8 +143,15 @@ def adzuna_search(extra_params):
     params.update(extra_params)
     url = "https://api.adzuna.com/v1/api/jobs/us/search/1?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.load(resp).get("results", [])
+    for attempt in range(3):  # Adzuna sometimes hiccups (503); wait and retry
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.load(resp).get("results", [])
+        except Exception as e:
+            if attempt == 2:
+                raise
+            print(f"Adzuna busy ({e}), retrying in 30 seconds...")
+            time.sleep(30)
 
 
 def is_match(job):
@@ -176,14 +185,31 @@ def location_ok(job):
     """Must be in Arizona; in-person/hybrid jobs must also be near Glendale."""
     loc = job.get("location") or {}
     places = " ".join(loc.get("area") or []) + " " + loc.get("display_name", "")
+    remote = work_mode(job) == "Remote"
     if not re.search(r"\barizona\b|\baz\b", places, re.I):
-        return False
-    if work_mode(job) == "Remote":
+        return remote and INCLUDE_REMOTE_OUT_OF_STATE
+    if remote:
         return True
+    miles = job_miles(job)
+    if miles is None:
+        return True  # no exact spot listed; Adzuna's radius search already limited it
+    return miles <= LOCAL_RADIUS_MILES + 5
+
+
+def job_miles(job):
+    loc = job.get("location") or {}
     lat, lon = job.get("latitude"), job.get("longitude")
     if lat is None or lon is None or len(loc.get("area") or []) < 3:
-        return True  # no exact spot listed; Adzuna's radius search already limited it
-    return miles_from_home(float(lat), float(lon)) <= LOCAL_RADIUS_MILES + 5
+        return None
+    return miles_from_home(float(lat), float(lon))
+
+
+def priority(job):
+    """Closest in-person/hybrid jobs first, then ones with no exact spot, then remote."""
+    if work_mode(job) == "Remote":
+        return (2, 0)
+    miles = job_miles(job)
+    return (0, miles) if miles is not None else (1, 0)
 
 
 def pay_ok(job):
@@ -236,7 +262,12 @@ BILINGUAL_RE = re.compile(r"\b(bilingual|spanish)\b", re.I)
 def send_alert(job):
     company = (job.get("company") or {}).get("display_name", "Company not listed")
     location = (job.get("location") or {}).get("display_name", "")
-    lines = [company, f"{location} · {work_mode(job)}", pay_text(job)]
+    mode = work_mode(job)
+    miles = job_miles(job)
+    where = f"{location} · {mode}"
+    if mode != "Remote" and miles is not None:
+        where += f" · about {miles:.0f} mi from home"
+    lines = [company, where, pay_text(job)]
     text = clean(job.get("title")) + " " + clean(job.get("description"))
     if BILINGUAL_RE.search(text):
         lines.insert(0, "⭐ Bilingual / Spanish role — her Spanish is a plus")
@@ -287,6 +318,8 @@ def main():
     searches = [{"where": HOME_ZIP, "distance": round(LOCAL_RADIUS_MILES * 1.609)}]
     if INCLUDE_REMOTE_ARIZONA:
         searches.append({"where": "Arizona", "what_and": "remote"})
+    if INCLUDE_REMOTE_OUT_OF_STATE:
+        searches.append({"what_and": "remote"})
 
     jobs = {}
     for params in searches:
@@ -300,6 +333,7 @@ def main():
     new = [j for j_id, j in jobs.items()
            if is_match(j) and j_id not in seen and fingerprint(j) not in seen]
     new.sort(key=lambda j: j.get("created", ""), reverse=True)
+    new.sort(key=priority)  # closest to Glendale first
     print(f"Checked {len(jobs)} postings, {len(new)} new matches.")
     skipped = [j for j in jobs.values() if not is_match(j)]
     if skipped:
