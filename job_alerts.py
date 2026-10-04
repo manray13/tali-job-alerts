@@ -28,7 +28,7 @@ INCLUDE_REMOTE_OUT_OF_STATE = False  # change to True if she's open to remote jo
                                      # for companies based outside Arizona
 MIN_HOURLY_PAY = 25          # skip jobs whose listed pay tops out below this
 KEEP_JOBS_WITHOUT_PAY = True  # many postings don't list pay; keep them
-MAX_DAYS_OLD = 3              # only look at postings from the last few days
+MAX_DAYS_OLD = 4              # only look at postings from the last few days
 
 # Google Jobs searches (via SerpAPI). Each line = 1 search per day (free plan: 250/month)
 GOOGLE_LOCAL_SEARCHES = [
@@ -127,7 +127,7 @@ EXCLUDE_TITLE = [
     "attorney", "actuary", "underwriter", "engineer", "developer",
     "pharmacy technician", "pharmacy tech", "medical assistant", "dental assistant",
     "phlebotomist", "phlebotomy", "technologist", "surgical", "cpc",
-    "clinical nurse", "case manager", "nurse practitioner",
+    "clinical nurse", "case manager", "nurse practitioner", "nursing", "nurses",
 ]
 
 # Skip jobs whose title OR description mentions any of these (animal care)
@@ -304,6 +304,9 @@ AZ_CITIES = {
     "gilbert": (33.35, -111.79), "buckeye": (33.37, -112.58), "cave creek": (33.83, -111.95),
     "tucson": (32.22, -110.97), "flagstaff": (35.20, -111.65), "yuma": (32.69, -114.63),
     "prescott": (34.54, -112.47), "casa grande": (32.88, -111.76), "florence": (33.03, -111.39),
+    "sun city west": (33.66, -112.34), "fountain hills": (33.61, -111.72), "paradise valley": (33.54, -111.96),
+    "anthem": (33.87, -112.15), "new river": (33.92, -112.14), "laveen": (33.36, -112.17),
+    "waddell": (33.56, -112.43), "wittmann": (33.78, -112.53), "queen creek": (33.25, -111.63),
 }
 
 
@@ -331,7 +334,11 @@ def find_state_jobs():
     q = urllib.parse.quote
     found, notes = {}, []
     for kw in STATE_SEARCHES:
-        code, ctype, body = state_get(f"{STATE_SITE}/jobs/search?page=1&query={q(kw)}")
+        url = f"{STATE_SITE}/jobs/search?page=1&query={q(kw)}"
+        code, ctype, body = state_get(url)
+        if code != 200:  # bot check or busy: wait and try once more
+            time.sleep(15)
+            code, ctype, body = state_get(url)
         body = (body or "").replace("\\/", "/")
         slugs = state_links(body)
         if not slugs:
@@ -342,7 +349,7 @@ def find_state_jobs():
             if not info["snippet"]:
                 i = body.find("/jobs/" + slug)
                 info["snippet"] = visible_text(body[i:i + 1500]) if i >= 0 else ""
-        time.sleep(1)
+        time.sleep(4)
     return found, notes
 
 
@@ -380,9 +387,19 @@ def state_slug_to_job(slug, info):
     if queries & {"ahcccs", "medicaid"} or "ahcccs" in snippet.lower():
         health_hint = "AHCCCS Medicaid health plan. "
     agency = "AHCCCS" if "ahcccs" in (snippet.lower() + " " + " ".join(queries)) else "State of Arizona"
+    if not city:  # city name may be anywhere in the address
+        padded = "-" + words + "-"
+        for name in sorted(AZ_CITIES, key=len, reverse=True):
+            if "-" + name.replace(" ", "-") + "-" in padded:
+                city = name
+                break
     lat = lon = None
     if city and not remote:
         lat, lon = AZ_CITIES[city]
+    if not remote:
+        # in-person state jobs: only keep ones in a known city near Glendale
+        if not city or miles_from_home(lat, lon) > LOCAL_RADIUS_MILES + 5:
+            return None
     import hashlib
     return {
         "id": "az:" + hashlib.md5(slug.encode()).hexdigest()[:16],
