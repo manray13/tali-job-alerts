@@ -41,9 +41,8 @@ GOOGLE_RADIUS_MILES = 25
 
 # State of Arizona jobs (azstatejobs.gov), including AHCCCS. Free, no key needed.
 STATE_JOBS = True
-STATE_SEARCHES = ["AHCCCS", "medical", "Medicaid", "customer service", "eligibility",
-                  "claims", "member services", "health"]
-STATE_DAYS_OLD = 14  # state jobs stay open for weeks; look back further
+STATE_SEARCHES = ["AHCCCS", "customer service", "eligibility", "medical", "claims",
+                  "member services", "Medicaid", "health"]
 
 # Words Adzuna uses to pull candidate jobs (any one can match)
 SEARCH_WORDS = [
@@ -308,70 +307,138 @@ AZ_CITIES = {
 }
 
 
-def state_search(keyword):
-    """Search azstatejobs.gov's own job list. Everything it returns is currently open."""
-    jobs = []
-    for page in (1, 2):
-        params = {"keywords": keyword, "page": page, "limit": 100,
-                  "sortBy": "posted_date", "descending": "true"}
-        url = STATE_SITE + "/api/jobs?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, headers={**BROWSER_HEADERS, "Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.load(resp)
-        batch = data.get("jobs") or []
-        for item in batch:
-            job = state_to_job(item.get("data") or item)
-            if job:
-                jobs.append(job)
-        if len(batch) < 100:
-            break
-    return jobs
+def state_get(url, accept="text/html,application/xhtml+xml", extra=None):
+    req = urllib.request.Request(url, headers={**BROWSER_HEADERS, "Accept": accept, **(extra or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, resp.headers.get("Content-Type", ""), resp.read(3_000_000).decode("utf-8", "ignore")
+    except urllib.error.HTTPError as e:
+        return e.code, "", ""
+    except Exception as e:
+        return None, str(e)[:80], ""
 
 
-def state_to_job(d):
-    title = d.get("title") or ""
+STATE_LINK_RE = re.compile(r"/jobs/([a-z0-9][a-z0-9\-]{5,})(?=[\"'?#\s<\\])")
+
+
+def state_links(body):
+    found = set(STATE_LINK_RE.findall(body.replace("\\/", "/")))
+    return {f for f in found if f not in ("search", "search-results")}
+
+
+def find_state_jobs():
+    """Collect job page addresses from azstatejobs.gov. Tries a few ways; logs what happened."""
+    q = urllib.parse.quote
+    ways = [
+        ("search page", lambda kw: (f"{STATE_SITE}/jobs/search?page=1&query={q(kw)}", "text/html", None)),
+        ("search page (xhr)", lambda kw: (f"{STATE_SITE}/jobs/search?page=1&query={q(kw)}",
+                                          "text/html, */*", {"X-Requested-With": "XMLHttpRequest"})),
+        ("search json", lambda kw: (f"{STATE_SITE}/jobs/search.json?page=1&query={q(kw)}",
+                                    "application/json", None)),
+    ]
+    notes = []
+    for name, build in ways:
+        slugs = set()
+        for kw in STATE_SEARCHES:
+            url, accept, extra = build(kw)
+            code, ctype, body = state_get(url, accept, extra)
+            got = state_links(body)
+            slugs |= got
+            if not got and kw == STATE_SEARCHES[0]:
+                notes.append(f"{name}: HTTP {code}, {ctype or 'no type'}, {len(body)} chars, 0 job links")
+                break  # this way doesn't work; don't try the other keywords
+        if slugs:
+            return slugs, name, notes
+    # last resort: the site map lists every job page
+    code, ctype, body = state_get(f"{STATE_SITE}/sitemap.xml", "application/xml,text/xml")
+    slugs = state_links(body)
+    for child in re.findall(r"<loc>([^<]+)</loc>", body)[:10]:
+        if "sitemap" in child and child.endswith((".xml", ".xml.gz")) and not child.endswith(".gz"):
+            slugs |= state_links(state_get(child, "application/xml,text/xml")[2])
+    if slugs:
+        return slugs, "site map", notes
+    notes.append(f"site map: HTTP {code}, {ctype or 'no type'}, {len(body)} chars, 0 job links")
+    return set(), None, notes
+
+
+def meta_tags(html):
+    tags = {}
+    for tag in re.findall(r"(?is)<meta\b[^>]*>", html):
+        attrs = dict((k.lower(), v) for k, _, v in re.findall(r'([\w:-]+)\s*=\s*(["\'])(.*?)\2', tag))
+        key = attrs.get("property") or attrs.get("name")
+        if key and "content" in attrs:
+            tags[key.lower()] = __import__("html").unescape(attrs["content"])
+    return tags
+
+
+def state_page_to_job(slug, page):
+    meta = meta_tags(page)
+    og_title = meta.get("og:title") or ""
+    title, _, loc = og_title.rpartition(" - ")
+    if not title:
+        title, loc = og_title, ""
     if not title:
         return None
-    posted = parse_date(d.get("posted_date") or d.get("create_date") or d.get("update_date"))
-    if posted and (datetime.now(timezone.utc) - posted).days > STATE_DAYS_OLD:
-        return None
-    city = (d.get("city") or "").strip()
-    where = " ".join(str(d.get(k) or "") for k in ("full_location", "location_name", "short_location"))
-    remote = "remote" in (where + " " + title).lower()
-    agency = (d.get("hiring_organization") or d.get("department") or d.get("business_unit")
-              or (d.get("meta_data") or {}).get("agency") or "State of Arizona")
-    desc = clean(d.get("description") or "")
-    if remote:
-        desc = "Remote options. " + desc
-    # pay is usually written in the description, e.g. "Salary: $41,000 - $46,000"
+    text = visible_text(page)
+    core = text.split("benefits:")[0] if len(text.split("benefits:")[0]) > 300 else text
+    city = loc.split(",")[0].strip().title()
+    remote = "remote" in (loc + " " + title).lower()
+    if "ahcccs" in core:
+        agency = "AHCCCS"
+    else:
+        first = (meta.get("og:description") or "").strip().split("\n")[0].strip()
+        agency = first.title() if first and len(first) < 80 else "State of Arizona"
     lo = hi = None
-    m = re.search(r"(?:salary|pay|compensation|grade)[^$]{0,60}(\$[\d,.]+(?:\s*(?:-|–|to)\s*\$[\d,.]+)?[^.;\n]{0,25})",
-                  desc, re.I)
-    if m:
+    m = re.search(r"salary:?\s*(.{0,80}?)(?:grade|open until|closing|job summary|$)", core)
+    if m and "$" in m.group(1):
         lo, hi = parse_google_salary(m.group(1))
-        if lo and lo < 1000 and "hour" not in m.group(1).lower():
-            lo, hi = lo * 2080, hi * 2080  # hourly amount written without "per hour"
+        if lo and lo < 1000:
+            lo, hi = lo * 2080, hi * 2080  # hourly amount
     lat = lon = None
     spot = AZ_CITIES.get(city.lower())
     if spot and not remote:
         lat, lon = spot
-    slug = d.get("slug") or d.get("req_id") or ""
     import hashlib
     return {
-        "id": "az:" + hashlib.md5(str(d.get("req_id") or slug).encode()).hexdigest()[:16],
-        "title": title,
-        "company": {"display_name": str(agency)},
-        "location": {"display_name": f"{city or 'Statewide'}, Arizona",
+        "id": "az:" + hashlib.md5(slug.encode()).hexdigest()[:16],
+        "title": title.strip(),
+        "company": {"display_name": agency},
+        "location": {"display_name": f"{'Remote options' if remote else city or 'Statewide'}, Arizona",
                      "area": ["US", "Arizona", city or "Statewide"]},
         "latitude": lat, "longitude": lon,
-        "description": desc,
+        "description": ("Remote options. " if remote else "") + core,
         "redirect_url": f"{STATE_SITE}/jobs/{slug}",
         "salary_min": lo, "salary_max": hi, "salary_is_predicted": "0",
-        "contract_time": "part_time" if "part" in str(d.get("employment_type", "")).lower() else "full_time",
-        "created": posted.isoformat() if posted else "",
+        "contract_time": "part_time" if "part-time" in core[:2000] and "full-time" not in core[:2000] else "full_time",
         "source": "AZ State Jobs (azstatejobs.gov)",
         "confirmed_open": True,  # it's in the state's live list right now
     }
+
+
+def state_jobs(seen):
+    """Find state jobs whose title fits, then read just those job pages."""
+    slugs, way, notes = find_state_jobs()
+    for n in notes:
+        print("  AZ State Jobs tried " + n)
+    if not slugs:
+        raise RuntimeError("couldn't get the job list (details above)")
+    import hashlib
+    wanted = []
+    for slug in sorted(slugs):
+        words = slug.replace("-", " ")
+        if TITLE_RE.search(words) and not EXCLUDE_RE.search(words) \
+                and "az:" + hashlib.md5(slug.encode()).hexdigest()[:16] not in seen:
+            wanted.append(slug)
+    print(f"AZ State Jobs: {len(slugs)} jobs found via {way}; reading {min(len(wanted), 60)} that fit by title.")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        pages = pool.map(lambda sl: (sl, state_get(f"{STATE_SITE}/jobs/{sl}")), wanted[:60])
+        jobs = []
+        for slug, (code, _, page) in pages:
+            if code == 200 and page:
+                job = state_page_to_job(slug, page)
+                if job:
+                    jobs.append(job)
+    return jobs
 
 
 # ---------------------------------------------------------------------
@@ -768,17 +835,14 @@ def main():
         print(f"Google Jobs returned {google_count} recent postings.")
 
     if STATE_JOBS:
-        state_count = 0
-        for kw in STATE_SEARCHES:
-            try:
-                for job in state_search(kw):
-                    if job["id"] not in jobs:
-                        jobs[job["id"]] = job
-                        state_count += 1
-            except Exception as e:
-                failures += 1
-                print(f"AZ State Jobs search failed ({kw}): {e}")
-        print(f"AZ State Jobs returned {state_count} recent postings.")
+        try:
+            state_found = state_jobs(load_seen())
+            for job in state_found:
+                jobs.setdefault(job["id"], job)
+            print(f"AZ State Jobs returned {len(state_found)} postings to check.")
+        except Exception as e:
+            failures += 1
+            print(f"AZ State Jobs search failed: {e}")
 
     if not jobs and failures:
         sys.exit("All searches failed; will try again next run.")
