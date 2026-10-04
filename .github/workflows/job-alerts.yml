@@ -2,8 +2,9 @@ name: Tali job alerts
 
 on:
   schedule:
-    # Every day at 10:00 AM Arizona time (17:00 UTC; Arizona = UTC-7)
-    - cron: "0 17 * * *"
+    # Monday-Friday at 10:17 AM Arizona time (17:17 UTC; Arizona = UTC-7).
+    # :17 instead of :00 because GitHub runs are often late at the top of the hour.
+    - cron: "17 17 * * 1-5"
   workflow_dispatch:   # adds a "Run workflow" button for testing
 
 permissions:
