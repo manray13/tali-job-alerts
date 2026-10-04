@@ -327,38 +327,77 @@ def state_links(body):
 
 
 def find_state_jobs():
-    """Collect job page addresses from azstatejobs.gov. Tries a few ways; logs what happened."""
+    """Read azstatejobs.gov search results. -> {slug: {"queries": set, "snippet": text}}"""
     q = urllib.parse.quote
-    ways = [
-        ("search page", lambda kw: (f"{STATE_SITE}/jobs/search?page=1&query={q(kw)}", "text/html", None)),
-        ("search page (xhr)", lambda kw: (f"{STATE_SITE}/jobs/search?page=1&query={q(kw)}",
-                                          "text/html, */*", {"X-Requested-With": "XMLHttpRequest"})),
-        ("search json", lambda kw: (f"{STATE_SITE}/jobs/search.json?page=1&query={q(kw)}",
-                                    "application/json", None)),
-    ]
-    notes = []
-    for name, build in ways:
-        slugs = set()
-        for kw in STATE_SEARCHES:
-            url, accept, extra = build(kw)
-            code, ctype, body = state_get(url, accept, extra)
-            got = state_links(body)
-            slugs |= got
-            if not got and kw == STATE_SEARCHES[0]:
-                notes.append(f"{name}: HTTP {code}, {ctype or 'no type'}, {len(body)} chars, 0 job links")
-                break  # this way doesn't work; don't try the other keywords
-        if slugs:
-            return slugs, name, notes
-    # last resort: the site map lists every job page
-    code, ctype, body = state_get(f"{STATE_SITE}/sitemap.xml", "application/xml,text/xml")
-    slugs = state_links(body)
-    for child in re.findall(r"<loc>([^<]+)</loc>", body)[:10]:
-        if "sitemap" in child and child.endswith((".xml", ".xml.gz")) and not child.endswith(".gz"):
-            slugs |= state_links(state_get(child, "application/xml,text/xml")[2])
-    if slugs:
-        return slugs, "site map", notes
-    notes.append(f"site map: HTTP {code}, {ctype or 'no type'}, {len(body)} chars, 0 job links")
-    return set(), None, notes
+    found, notes = {}, []
+    for kw in STATE_SEARCHES:
+        code, ctype, body = state_get(f"{STATE_SITE}/jobs/search?page=1&query={q(kw)}")
+        body = (body or "").replace("\\/", "/")
+        slugs = state_links(body)
+        if not slugs:
+            notes.append(f"search '{kw}': HTTP {code}, {ctype or 'no type'}, {len(body)} chars, 0 job links")
+        for slug in slugs:
+            info = found.setdefault(slug, {"queries": set(), "snippet": ""})
+            info["queries"].add(kw.lower())
+            if not info["snippet"]:
+                i = body.find("/jobs/" + slug)
+                info["snippet"] = visible_text(body[i:i + 1500]) if i >= 0 else ""
+        time.sleep(1)
+    return found, notes
+
+
+UUID_TAIL = re.compile(r"-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def state_slug_to_job(slug, info):
+    """Build the job from its web address, e.g.
+    customer-service-representative-2-remote-options-arizona-united-states-phoenix-<id>"""
+    words = UUID_TAIL.sub("", slug)
+    before, _, after = words.partition("-arizona-united-states")
+    remote = False
+    if before.endswith("-remote-options"):
+        remote, before = True, before[: -len("-remote-options")]
+    city = ""
+    for name in sorted(AZ_CITIES, key=len, reverse=True):
+        dashed = name.replace(" ", "-")
+        if before.endswith("-" + dashed):
+            city, before = name, before[: -len(dashed) - 1]
+            break
+    if not city:
+        for name in AZ_CITIES:  # city sometimes comes after "arizona-united-states"
+            if after.strip("-").startswith(name.replace(" ", "-")):
+                city = name
+                break
+    if before.endswith("-various-statewide"):
+        before = before[: -len("-various-statewide")]
+    title = " ".join(w.upper() if w in ("ii", "iii", "iv") else w.capitalize()
+                     for w in before.split("-") if w)
+    if not title:
+        return None
+    snippet = info.get("snippet", "")
+    queries = info.get("queries", set())
+    health_hint = ""
+    if queries & {"ahcccs", "medicaid"} or "ahcccs" in snippet.lower():
+        health_hint = "AHCCCS Medicaid health plan. "
+    agency = "AHCCCS" if "ahcccs" in (snippet.lower() + " " + " ".join(queries)) else "State of Arizona"
+    lat = lon = None
+    if city and not remote:
+        lat, lon = AZ_CITIES[city]
+    import hashlib
+    return {
+        "id": "az:" + hashlib.md5(slug.encode()).hexdigest()[:16],
+        "title": title,
+        "company": {"display_name": agency},
+        "location": {"display_name": f"{'Remote options' if remote else city.title() or 'Statewide'}, Arizona",
+                     "area": ["US", "Arizona", city.title() or "Statewide"]},
+        "latitude": lat, "longitude": lon,
+        "description": ("Remote options. " if remote else "") + health_hint + snippet,
+        "redirect_url": f"{STATE_SITE}/jobs/{slug}",
+        "salary_min": None, "salary_max": None, "salary_is_predicted": "0",
+        "contract_time": None,
+        "source": "AZ State Jobs (azstatejobs.gov)",
+        "confirmed_open": True,  # it's in the state's live list right now
+    }
 
 
 def meta_tags(html):
@@ -419,40 +458,19 @@ def state_page_to_job(slug, page):
 
 
 def state_jobs(seen):
-    """Find state jobs whose title fits, then read just those job pages."""
-    slugs, way, notes = find_state_jobs()
+    """State job pages block scripts, so build each job from the search results."""
+    found, notes = find_state_jobs()
     for n in notes:
-        print("  AZ State Jobs tried " + n)
-    if not slugs:
+        print("  AZ State Jobs " + n)
+    if not found:
         raise RuntimeError("couldn't get the job list (details above)")
-    import hashlib
-    wanted = []
-    for slug in sorted(slugs):
-        words = slug.replace("-", " ")
-        if TITLE_RE.search(words) and not EXCLUDE_RE.search(words) \
-                and "az:" + hashlib.md5(slug.encode()).hexdigest()[:16] not in seen:
-            wanted.append(slug)
-    print(f"AZ State Jobs: {len(slugs)} jobs found via {way}; reading {min(len(wanted), 60)} that fit by title.")
-    jobs, problems = [], []
-    for slug in wanted[:60]:
-        code, ctype, page = state_get(f"{STATE_SITE}/jobs/{slug}")
-        if code == 429 or code is None:  # busy or slow: wait and try once more
-            time.sleep(5)
-            code, ctype, page = state_get(f"{STATE_SITE}/jobs/{slug}")
-        job = state_page_to_job(slug, page) if code == 200 and page else None
-        if job:
+    jobs = []
+    for slug, info in found.items():
+        job = state_slug_to_job(slug, info)
+        if job and job["id"] not in seen:
             jobs.append(job)
-        else:
-            t = re.search(r"(?is)<title[^>]*>(.*?)</title>", page or "")
-            problems.append(f"HTTP {code}, {ctype or 'no type'}, {len(page or '')} chars, "
-                            f"page title: {clean(t.group(1))[:60] if t else 'none'} | {slug[:50]}")
-        time.sleep(1)  # be polite: one page at a time
-    if problems:
-        print(f"  Couldn't read {len(problems)} state job page(s). First few:")
-        for pr in problems[:5]:
-            print("   - " + pr)
+    print(f"AZ State Jobs: {len(found)} jobs in search results, {len(jobs)} not seen before.")
     return jobs
-
 
 # ---------------------------------------------------------------------
 #  "Is this job still open?" check
