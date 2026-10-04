@@ -373,7 +373,10 @@ def meta_tags(html):
 
 def state_page_to_job(slug, page):
     meta = meta_tags(page)
-    og_title = meta.get("og:title") or ""
+    og_title = meta.get("og:title") or meta.get("twitter:title") or ""
+    if not og_title:
+        t = re.search(r"(?is)<title[^>]*>(.*?)</title>", page)
+        og_title = clean(t.group(1)) if t else ""
     title, _, loc = og_title.rpartition(" - ")
     if not title:
         title, loc = og_title, ""
@@ -430,14 +433,24 @@ def state_jobs(seen):
                 and "az:" + hashlib.md5(slug.encode()).hexdigest()[:16] not in seen:
             wanted.append(slug)
     print(f"AZ State Jobs: {len(slugs)} jobs found via {way}; reading {min(len(wanted), 60)} that fit by title.")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-        pages = pool.map(lambda sl: (sl, state_get(f"{STATE_SITE}/jobs/{sl}")), wanted[:60])
-        jobs = []
-        for slug, (code, _, page) in pages:
-            if code == 200 and page:
-                job = state_page_to_job(slug, page)
-                if job:
-                    jobs.append(job)
+    jobs, problems = [], []
+    for slug in wanted[:60]:
+        code, ctype, page = state_get(f"{STATE_SITE}/jobs/{slug}")
+        if code == 429 or code is None:  # busy or slow: wait and try once more
+            time.sleep(5)
+            code, ctype, page = state_get(f"{STATE_SITE}/jobs/{slug}")
+        job = state_page_to_job(slug, page) if code == 200 and page else None
+        if job:
+            jobs.append(job)
+        else:
+            t = re.search(r"(?is)<title[^>]*>(.*?)</title>", page or "")
+            problems.append(f"HTTP {code}, {ctype or 'no type'}, {len(page or '')} chars, "
+                            f"page title: {clean(t.group(1))[:60] if t else 'none'} | {slug[:50]}")
+        time.sleep(1)  # be polite: one page at a time
+    if problems:
+        print(f"  Couldn't read {len(problems)} state job page(s). First few:")
+        for pr in problems[:5]:
+            print("   - " + pr)
     return jobs
 
 
