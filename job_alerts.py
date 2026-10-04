@@ -7,6 +7,8 @@ Runs on GitHub Actions (see .github/workflows/job-alerts.yml).
 
 import json
 import os
+import concurrent.futures
+import urllib.error
 import re
 import sys
 import time
@@ -36,6 +38,12 @@ GOOGLE_LOCAL_SEARCHES = [
 ]
 GOOGLE_REMOTE_SEARCH = "remote member services healthcare insurance Arizona"
 GOOGLE_RADIUS_MILES = 25
+
+# State of Arizona jobs (azstatejobs.gov), including AHCCCS. Free, no key needed.
+STATE_JOBS = True
+STATE_SEARCHES = ["AHCCCS", "medical", "Medicaid", "customer service", "eligibility",
+                  "claims", "member services", "health"]
+STATE_DAYS_OLD = 14  # state jobs stay open for weeks; look back further
 
 # Words Adzuna uses to pull candidate jobs (any one can match)
 SEARCH_WORDS = [
@@ -133,6 +141,11 @@ EXCLUDE_ANYWHERE = [
     "certified medical assistant", "cma required", "ptcb",
 ]
 
+# Before sending, open each posting's link. Closed/expired/filled jobs are skipped.
+# Jobs we actually see on the page are sent as ✅ Confirmed open. Jobs we can't
+# reach (bot checks, blocked sites) are sent quietly as ❓ Possibly expired.
+CHECK_IF_STILL_OPEN = True
+
 MAX_ALERTS_PER_RUN = 25       # extras wait for the next run instead of spamming
 FORGET_AFTER_DAYS = 45        # how long to remember jobs already sent
 
@@ -229,7 +242,9 @@ def google_to_job(g):
     options = g.get("apply_options") or []
     direct = [o for o in options if not any(b in (o.get("title", "") + o.get("link", "")).lower()
                                              for b in JOB_BOARDS)]
-    link = (direct or options or [{}])[0].get("link") or g.get("share_link", "")
+    others = [o for o in options if o not in direct]
+    apply_links = [o.get("link") for o in direct + others if o.get("link")]
+    link = (apply_links or [g.get("share_link", "")])[0]
     lo, hi = parse_google_salary(ext.get("salary"))
     loc = g.get("location", "")
     desc = g.get("description", "")
@@ -244,6 +259,7 @@ def google_to_job(g):
         "location": {"display_name": loc, "area": [p.strip() for p in loc.split(",") if p.strip()]},
         "description": desc,
         "redirect_url": link,
+        "apply_links": apply_links,
         "salary_min": lo, "salary_max": hi, "salary_is_predicted": "0",
         "contract_time": sched if sched in ("full_time", "part_time") else None,
         "posted_label": ext.get("posted_at", ""),
@@ -271,6 +287,282 @@ def google_search(query, location, remote=False):
         if google_days_old(job["posted_label"]) <= MAX_DAYS_OLD:
             jobs.append(job)
     return jobs
+
+
+# ---------------------------------------------------------------------
+#  State of Arizona jobs (azstatejobs.gov)
+# ---------------------------------------------------------------------
+
+STATE_SITE = "https://www.azstatejobs.gov"
+
+# Rough map spots so in-person state jobs can be measured from Glendale
+AZ_CITIES = {
+    "glendale": (33.54, -112.19), "phoenix": (33.45, -112.07), "peoria": (33.58, -112.24),
+    "surprise": (33.63, -112.37), "sun city": (33.60, -112.27), "el mirage": (33.61, -112.32),
+    "youngtown": (33.59, -112.30), "avondale": (33.44, -112.35), "goodyear": (33.44, -112.36),
+    "tolleson": (33.45, -112.26), "litchfield park": (33.49, -112.36), "scottsdale": (33.49, -111.93),
+    "tempe": (33.43, -111.94), "mesa": (33.42, -111.83), "chandler": (33.31, -111.84),
+    "gilbert": (33.35, -111.79), "buckeye": (33.37, -112.58), "cave creek": (33.83, -111.95),
+    "tucson": (32.22, -110.97), "flagstaff": (35.20, -111.65), "yuma": (32.69, -114.63),
+    "prescott": (34.54, -112.47), "casa grande": (32.88, -111.76), "florence": (33.03, -111.39),
+}
+
+
+def state_search(keyword):
+    """Search azstatejobs.gov's own job list. Everything it returns is currently open."""
+    jobs = []
+    for page in (1, 2):
+        params = {"keywords": keyword, "page": page, "limit": 100,
+                  "sortBy": "posted_date", "descending": "true"}
+        url = STATE_SITE + "/api/jobs?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={**BROWSER_HEADERS, "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.load(resp)
+        batch = data.get("jobs") or []
+        for item in batch:
+            job = state_to_job(item.get("data") or item)
+            if job:
+                jobs.append(job)
+        if len(batch) < 100:
+            break
+    return jobs
+
+
+def state_to_job(d):
+    title = d.get("title") or ""
+    if not title:
+        return None
+    posted = parse_date(d.get("posted_date") or d.get("create_date") or d.get("update_date"))
+    if posted and (datetime.now(timezone.utc) - posted).days > STATE_DAYS_OLD:
+        return None
+    city = (d.get("city") or "").strip()
+    where = " ".join(str(d.get(k) or "") for k in ("full_location", "location_name", "short_location"))
+    remote = "remote" in (where + " " + title).lower()
+    agency = (d.get("hiring_organization") or d.get("department") or d.get("business_unit")
+              or (d.get("meta_data") or {}).get("agency") or "State of Arizona")
+    desc = clean(d.get("description") or "")
+    if remote:
+        desc = "Remote options. " + desc
+    # pay is usually written in the description, e.g. "Salary: $41,000 - $46,000"
+    lo = hi = None
+    m = re.search(r"(?:salary|pay|compensation|grade)[^$]{0,60}(\$[\d,.]+(?:\s*(?:-|–|to)\s*\$[\d,.]+)?[^.;\n]{0,25})",
+                  desc, re.I)
+    if m:
+        lo, hi = parse_google_salary(m.group(1))
+        if lo and lo < 1000 and "hour" not in m.group(1).lower():
+            lo, hi = lo * 2080, hi * 2080  # hourly amount written without "per hour"
+    lat = lon = None
+    spot = AZ_CITIES.get(city.lower())
+    if spot and not remote:
+        lat, lon = spot
+    slug = d.get("slug") or d.get("req_id") or ""
+    import hashlib
+    return {
+        "id": "az:" + hashlib.md5(str(d.get("req_id") or slug).encode()).hexdigest()[:16],
+        "title": title,
+        "company": {"display_name": str(agency)},
+        "location": {"display_name": f"{city or 'Statewide'}, Arizona",
+                     "area": ["US", "Arizona", city or "Statewide"]},
+        "latitude": lat, "longitude": lon,
+        "description": desc,
+        "redirect_url": f"{STATE_SITE}/jobs/{slug}",
+        "salary_min": lo, "salary_max": hi, "salary_is_predicted": "0",
+        "contract_time": "part_time" if "part" in str(d.get("employment_type", "")).lower() else "full_time",
+        "created": posted.isoformat() if posted else "",
+        "source": "AZ State Jobs (azstatejobs.gov)",
+        "confirmed_open": True,  # it's in the state's live list right now
+    }
+
+
+# ---------------------------------------------------------------------
+#  "Is this job still open?" check
+# ---------------------------------------------------------------------
+
+CLOSED_PHRASES = [
+    "no longer accepting applications", "not accepting applications",
+    "this job has expired", "job has expired", "job posting has expired",
+    "posting has expired", "this job is no longer available",
+    "job is no longer available", "position is no longer available",
+    "posting is no longer available", "this job is no longer open",
+    "position has been filled", "job has been filled", "requisition has been filled",
+    "this position is closed", "this job is closed", "job posting is closed",
+    "this job has been closed", "posting has been closed", "job has been removed",
+    "the job you are looking for is no longer", "the job you're looking for is no longer",
+    "job you are trying to apply for has been filled", "this requisition is no longer",
+    "applications are closed", "applications have closed", "has expired on indeed",
+    "job not found", "we couldn't find this job", "job is not available",
+]
+CLOSED_URL_HINTS = ["expired", "jobnotfound", "job-not-found", "notfound",
+                    "no-longer-available", "jobclosed", "job-closed", "error=404"]
+# "Are you a real person?" pages (Cloudflare, Indeed, Imperva, DataDome, etc.)
+BOT_CHECK_TEXT = [
+    "verify you are human", "verifying you are human", "verify you're human",
+    "confirm you are human", "are you a robot", "are you a human", "not a robot",
+    "checking your browser", "checking if the site connection is secure",
+    "just a moment...", "press & hold", "press and hold", "unusual traffic",
+    "security check", "complete the security check", "enable javascript and cookies",
+    "access denied", "request unsuccessful", "please verify you are a human",
+    "attention required", "bot detection", "human verification",
+]
+BOT_CHECK_CODE = [
+    "challenge-platform", "cf-chl", "cf_chl", "cf-turnstile", "captcha-delivery",
+    "px-captcha", "_incapsula_resource", "perimeterx", "datadome",
+]
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/128.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def fetch(url, timeout=15):
+    """-> (http status or None, final url after redirects, page text)"""
+    req = urllib.request.Request(url, headers=BROWSER_HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.geturl(), resp.read(800_000).decode("utf-8", "ignore")
+    except urllib.error.HTTPError as e:
+        return e.code, url, ""
+    except Exception:
+        return None, url, ""
+
+
+def visible_text(html):
+    """Drop scripts/styles (they often contain 'job expired' wording on every page)."""
+    html = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", html)
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).lower()
+
+
+def is_bot_check(html, text):
+    """True if we landed on a 'prove you're a person' page instead of the job."""
+    raw = html.lower()
+    if any(m in raw for m in BOT_CHECK_CODE):
+        return True
+    if any(p in text for p in BOT_CHECK_TEXT):
+        return True
+    # a tiny page with a captcha widget is a check page, not a job posting
+    return len(text) < 1500 and ("captcha" in raw or "turnstile" in raw)
+
+
+def workday_api_url(url):
+    """Workday career pages load the job with JavaScript, so ask Workday directly."""
+    u = urllib.parse.urlparse(url)
+    if "myworkdayjobs.com" not in u.netloc:
+        return None
+    m = re.match(r"^/(?:[a-z]{2}-[A-Z]{2}/)?([^/]+)/(job/.+)$", u.path)
+    if not m:
+        return None
+    tenant = u.netloc.split(".")[0]
+    return f"https://{u.netloc}/wday/cxs/{tenant}/{m.group(1)}/{m.group(2)}"
+
+
+def link_status(url, title=""):
+    """'closed', 'open' (we saw the actual job), or 'unknown' (blocked / couldn't tell)."""
+    if not url:
+        return "unknown"
+    api = workday_api_url(url)
+    if api:
+        code, _, body = fetch(api)
+        if code in (404, 410):
+            return "closed"
+        if code == 200:
+            try:
+                info = json.loads(body).get("jobPostingInfo") or {}
+                return "closed" if info.get("canApply") is False else "open"
+            except Exception:
+                pass
+    code, final, html = fetch(url)
+    if code in (404, 410):
+        return "closed"
+    if code is None or code >= 400 or not html:
+        return "unknown"
+    if final != url:
+        f = urllib.parse.urlparse(final)
+        if any(h in (f.path + "?" + f.query).lower() for h in CLOSED_URL_HINTS):
+            return "closed"
+        if f.path.strip("/") == "" and urllib.parse.urlparse(url).path.strip("/"):
+            return "closed"  # job link bounced to the site's home page
+    text = visible_text(html)
+    if is_bot_check(html, text):
+        return "unknown"
+    if any(p in text for p in CLOSED_PHRASES):
+        return "closed"
+    posting = job_posting_data(html)
+    if posting is not None:
+        ends = parse_date(posting.get("validThrough"))
+        if ends and ends < datetime.now(timezone.utc):
+            return "closed"  # the page's own "apply by" date has passed
+        return "open"
+    if title_on_page(title, text):
+        return "open"
+    return "unknown"  # page loaded, but we couldn't see the job on it
+
+
+def job_posting_data(html):
+    """Most job pages include hidden 'JobPosting' data for Google. Returns it, or None."""
+    for block in re.findall(r'(?is)<script[^>]*application/ld\+json[^>]*>(.*?)</script>', html):
+        try:
+            data = json.loads(block.strip())
+        except Exception:
+            continue
+        items = data if isinstance(data, list) else data.get("@graph", [data]) if isinstance(data, dict) else []
+        for item in items:
+            if isinstance(item, dict):
+                kind = item.get("@type")
+                kinds = kind if isinstance(kind, list) else [kind]
+                if "JobPosting" in kinds:
+                    return item
+    return None
+
+
+def parse_date(value):
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            dt = datetime.strptime(value.strip()[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=ARIZONA)
+
+
+TITLE_STOPWORDS = {"and", "or", "the", "of", "a", "an", "to", "for", "in", "at", "with",
+                   "i", "ii", "iii", "iv", "1", "2", "3", "sr", "jr", "full", "part", "time"}
+
+
+def title_on_page(title, text):
+    """Most of the job title's words appear on the page."""
+    words = [w for w in re.findall(r"[a-z]+", (title or "").lower())
+             if w not in TITLE_STOPWORDS and len(w) > 2]
+    if not words:
+        return False
+    found = sum(1 for w in words if re.search(r"\b" + re.escape(w), text))
+    return found / len(words) >= 0.75
+
+
+def job_status(job):
+    """Try up to 3 links for the job. Any open one wins and becomes the alert link."""
+    if job.get("confirmed_open"):
+        return "open"
+    links = list(dict.fromkeys((job.get("apply_links") or []) + [job.get("redirect_url")]))
+    results = []
+    for link in [l for l in links if l][:3]:
+        status = link_status(link, clean(job.get("title")))
+        if status == "open":
+            job["redirect_url"] = link
+            return "open"
+        results.append(status)
+    return "closed" if results and all(r == "closed" for r in results) else "unknown"
+
+
+def check_still_open(jobs):
+    """Checks jobs in parallel; returns {id: status}."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        statuses = pool.map(job_status, jobs)
+        return {str(j.get("id")): s for j, s in zip(jobs, statuses)}
 
 
 def is_match(job):
@@ -397,12 +689,18 @@ def send_alert(job):
         lines.append(job["contract_time"].replace("_", " ").title())
     lines.append(posted_text(job))
     lines.append("Found on " + job.get("source", "Adzuna"))
+    status = job.get("open_status")
+    if status == "open":
+        lines.insert(0, "✅ Confirmed open — the posting loaded")
+    elif status == "unknown":
+        lines.insert(0, "❓ Possibly expired — couldn't reach the posting to confirm")
     body = {
         "topic": NTFY_TOPIC,
-        "title": clean(job.get("title"))[:120],
+        "title": (("❓ " if status == "unknown" else "") + clean(job.get("title")))[:120],
         "message": "\n".join(l for l in lines if l),
         "click": job.get("redirect_url", ""),
         "tags": ["briefcase"],
+        "priority": 2 if status == "unknown" else 3,  # 2 = quiet, no sound or buzz
         "actions": [
             {"action": "view", "label": "Open posting", "url": job.get("redirect_url", "")},
             {"action": "view", "label": "Find on Google",
@@ -469,6 +767,19 @@ def main():
                 print(f"Google Jobs search failed ({q}): {e}")
         print(f"Google Jobs returned {google_count} recent postings.")
 
+    if STATE_JOBS:
+        state_count = 0
+        for kw in STATE_SEARCHES:
+            try:
+                for job in state_search(kw):
+                    if job["id"] not in jobs:
+                        jobs[job["id"]] = job
+                        state_count += 1
+            except Exception as e:
+                failures += 1
+                print(f"AZ State Jobs search failed ({kw}): {e}")
+        print(f"AZ State Jobs returned {state_count} recent postings.")
+
     if not jobs and failures:
         sys.exit("All searches failed; will try again next run.")
 
@@ -485,6 +796,22 @@ def main():
             print(f"  - {clean(j.get('title'))} | {(j.get('company') or {}).get('display_name', '')}")
 
     now = time.time()
+    if CHECK_IF_STILL_OPEN and new:
+        to_check = new[:MAX_ALERTS_PER_RUN * 2]
+        statuses = check_still_open(to_check)
+        closed = [j for j in to_check if statuses[str(j.get("id"))] == "closed"]
+        for j in to_check:
+            j["open_status"] = statuses[str(j.get("id"))]
+        for j in closed:
+            seen[str(j.get("id"))] = now  # don't check it again tomorrow
+        print(f"Still-open check: {sum(1 for s in statuses.values() if s == 'open')} confirmed open, "
+              f"{sum(1 for s in statuses.values() if s == 'unknown')} possibly expired, "
+              f"{len(closed)} closed/expired skipped.")
+        for j in closed:
+            print(f"  - closed: {clean(j.get('title'))} | {(j.get('company') or {}).get('display_name', '')}")
+        new = [j for j in to_check if j["open_status"] != "closed"]
+        new.sort(key=lambda j: j["open_status"] != "open")  # confirmed ones first
+
     sent = 0
     for job in new[:MAX_ALERTS_PER_RUN]:
         try:
